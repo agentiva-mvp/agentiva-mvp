@@ -62,4 +62,4 @@ if qa:
     user_question = st.text_input("❓ Deine Frage eingeben:")
     if user_question:
         with st.spinner("Denke nach..."):
-            result = qa({"question": user_question})_
+            result = qa({"question": user_question})
