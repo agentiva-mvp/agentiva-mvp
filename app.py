@@ -28,10 +28,10 @@ embeddings = OpenAIEmbeddings(
 # === Vektordatenbank laden ===
 vectordb = None
 if os.path.isdir(PERSIST_DIR):
-    vectordb = DocArrayHnswSearch.load_local(
-        PERSIST_DIR,
-        embeddings,
-        n_dim=1536  # Dimension für embedding-small
+    vectordb = DocArrayHnswSearch.from_params(
+        embedding=embeddings,
+        work_dir=PERSIST_DIR,
+        n_dim=1536
     )
 
 # === LLM initialisieren ===
