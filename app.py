@@ -6,10 +6,10 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 
 # === Einstellungen ===
-PERSIST_DIR = "agentiva_db"   # Ordner mit der Datenbank
-DEPLOYMENT_NAME = "gpt-4o"    # dein Chat-Deployment
+PERSIST_DIR = "agentiva_db"         # Ordner mit der Datenbank
+DEPLOYMENT_NAME = "gpt-4o"          # dein Chat-Deployment
 EMBEDDING_NAME = "embedding_small"  # dein Embedding-Deployment
-API_VERSION = "2024-06-01"    # Version aus Azure
+API_VERSION = "2024-06-01"          # Version aus Azure
 ENDPOINT = "https://mirko-memqopyf-eastus2.services.ai.azure.com/models"
 
 # API-Key aus Umgebungsvariable
@@ -17,7 +17,7 @@ AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 if not AZURE_OPENAI_KEY:
     raise ValueError("❌ Kein API-Key gefunden! Bitte export AZURE_OPENAI_KEY setzen.")
 
-# === Embeddings und LLM initialisieren ===
+# === Embeddings initialisieren ===
 embeddings = OpenAIEmbeddings(
     model=EMBEDDING_NAME,
     openai_api_key=AZURE_OPENAI_KEY,
@@ -25,14 +25,16 @@ embeddings = OpenAIEmbeddings(
     openai_api_base=ENDPOINT
 )
 
+# === Vektordatenbank laden ===
 vectordb = None
 if os.path.isdir(PERSIST_DIR):
-    vectordb = DocArrayHnswSearch(
+    vectordb = DocArrayHnswSearch.load_local(
+        PERSIST_DIR,
         embeddings,
-        work_dir=PERSIST_DIR,
         n_dim=1536  # Dimension für embedding-small
     )
 
+# === LLM initialisieren ===
 llm = AzureChatOpenAI(
     deployment_name=DEPLOYMENT_NAME,
     openai_api_key=AZURE_OPENAI_KEY,
@@ -42,6 +44,7 @@ llm = AzureChatOpenAI(
 )
 
 # === Retrieval-Chain mit Memory ===
+qa = None
 if vectordb:
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     qa = ConversationalRetrievalChain.from_llm(
@@ -49,8 +52,6 @@ if vectordb:
         retriever=vectordb.as_retriever(),
         memory=memory
     )
-else:
-    qa = None
 
 # === Streamlit UI ===
 st.set_page_config(page_title="Agentiva – KI-Agent für Vertrieb", page_icon="🤖")
@@ -63,3 +64,12 @@ if qa:
     if user_question:
         with st.spinner("Denke nach..."):
             result = qa({"question": user_question})
+            st.markdown("### 💡 Antwort")
+            st.write(result["answer"])
+
+            if "source_documents" in result:
+                st.markdown("### 📚 Quellen")
+                for doc in result["source_documents"]:
+                    st.write(doc.metadata.get("source", "Unbekannt"))
+else:
+    st.warning("⚠️ Keine Wissensdatenbank gefunden. Bitte zuerst `build_db.py` ausführen und `agentiva_db/` ins Repo pushen.")
