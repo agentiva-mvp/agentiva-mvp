@@ -1,0 +1,5 @@
+# Keine Secrets committen
+.envrc
+.envrc.save
+.direnv/
+
