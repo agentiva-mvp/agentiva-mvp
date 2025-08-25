@@ -1,54 +1,43 @@
 import os
+import glob
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import DocArrayHnswSearch
+from langchain_community.vectorstores import Chroma
 
-# === Einstellungen ===
-DATA_DIR = "unterlagen"       # Ordner mit deinen PDFs
-PERSIST_DIR = "agentiva_db"   # Speicherort für die Vektordatenbank
-DEPLOYMENT_NAME = "embedding_small"  # dein Embedding-Deployment
-API_VERSION = "2024-06-01"    # oder die Version aus Azure
-ENDPOINT = "https://mirko-memqopyf-eastus2.services.ai.azure.com/models"
+# === Parameter ===
+PERSIST_DIR = "agentiva_db"
+DOCS_DIR = "unterlagen"
 
-# API-Key sicher aus Umgebungsvariable laden
-AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
-if not AZURE_OPENAI_KEY:
-    raise ValueError("❌ Kein API-Key gefunden! Bitte export AZURE_OPENAI_KEY setzen.")
+ENDPOINT = "https://mirko-memqopyf-eastus2.services.ai.azure.com/"
+API_VERSION = "2024-06-01"
+EMBEDDING_DEPLOYMENT = "embedding_small"
 
-# === Embeddings initialisieren ===
-embeddings = OpenAIEmbeddings(
-    model=DEPLOYMENT_NAME,
-    openai_api_key=AZURE_OPENAI_KEY,
-    openai_api_version=API_VERSION,
-    openai_api_base=ENDPOINT
-)
-
-# === Hauptfunktion ===
-def main():
-    print("📚 Lade Dokumente…")
+def load_documents():
     docs = []
-    for file in os.listdir(DATA_DIR):
-        if file.endswith(".pdf"):
-            loader = PyPDFLoader(os.path.join(DATA_DIR, file))
-            docs.extend(loader.load())
+    for file in glob.glob(f"{DOCS_DIR}/*.pdf"):
+        loader = PyPDFLoader(file)
+        docs.extend(loader.load())
+    return docs
 
-    print(f"➡️ {len(docs)} Dokumente gefunden")
-
-    # Texte in Chunks teilen
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(docs)
-    print(f"➡️ In {len(chunks)} Text-Chunks geteilt")
-
-    # Vektordatenbank aufbauen
-    vectordb = DocArrayHnswSearch.from_documents(
-        chunks,
-        embeddings,
-        work_dir=PERSIST_DIR,
-        n_dim=1536  # Dimension für Embedding-Small (1536 für text-embedding-3-small)
+def main():
+    # Embeddings für Azure
+    embeddings = AzureOpenAIEmbeddings(
+        deployment=EMBEDDING_DEPLOYMENT,
+        openai_api_key=os.getenv("AZURE_OPENAI_KEY"),
+        azure_endpoint=ENDPOINT,
+        openai_api_version=API_VERSION
     )
 
-    print("✅ Wissensdatenbank erstellt und gespeichert!")
+    # PDFs laden und in Chunks teilen
+    docs = load_documents()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_documents(docs)
+
+    # Vektor-DB bauen & speichern
+    vectordb = Chroma.from_documents(chunks, embeddings, persist_directory=PERSIST_DIR)
+    vectordb.persist()
+    print(f"✅ Wissensdatenbank erstellt: {len(docs)} Dokumente, {len(chunks)} Chunks")
 
 if __name__ == "__main__":
     main()
