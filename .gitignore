@@ -3,3 +3,6 @@
 .envrc.save
 .direnv/
 
+.DS_Store
+**/.DS_Store
+.venv/
