@@ -1,0 +1,6 @@
+.envrc
+.env
+.direnv/
+.venv/
+agentiva_db/
+.DS_Store
