@@ -146,7 +146,7 @@ def answer_with_context(question: str, passages: list[dict]) -> str:
         "Wenn die Antwort nicht sicher aus den Quellen hervorgeht, sage ehrlich, dass es nicht eindeutig ist."
     )
     user_msg = f"Frage:\n{question}\n\nKontexte:\n{context}"
-    msg = llm.invoke([{"role":"system","content":system},{"role":"user","content":user_msg}])
+    msg = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user_msg}])
     return msg.content
 
 st.divider()
