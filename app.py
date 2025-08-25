@@ -22,7 +22,7 @@ if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT:
 INDEX_DIR = "agentiva_db"
 INDEX_NPZ = os.path.join(INDEX_DIR, "index.npz")
 INDEX_META = os.path.join(INDEX_DIR, "metadaten.json")
-INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")  # extra für Index-Zeitpunkt
+INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")
 UNTERLAGEN_DIR = "unterlagen"
 
 st.set_page_config(page_title="Agentiva – Marketing-Lotse", page_icon="🧭", layout="wide")
@@ -59,7 +59,6 @@ def load_index():
                     info = json.load(f)
             except Exception:
                 info = {}
-        # Fallback: alte Indexe ohne last_modified ergänzen
         for m in M:
             m.setdefault("last_modified", None)
         return E, M, info
@@ -78,9 +77,7 @@ def build_index_now():
             chunks.append(text[start:end])
             if end == n:
                 break
-            start = end - overlap
-            if start < 0:
-                start = 0
+            start = max(0, end - overlap)
         return chunks
 
     pdfs = [os.path.join(UNTERLAGEN_DIR, p) for p in os.listdir(UNTERLAGEN_DIR) if p.lower().endswith(".pdf")]
@@ -98,7 +95,6 @@ def build_index_now():
         if not text.strip():
             continue
 
-        # Änderungszeitpunkt der Datei erfassen
         try:
             mtime = os.path.getmtime(p)
         except Exception:
@@ -114,7 +110,6 @@ def build_index_now():
                 "last_modified": mtime,
             })
 
-    # Embeddings in Batches
     vecs = []
     BATCH = 64
     for i in range(0, len(all_chunks), BATCH):
@@ -128,7 +123,6 @@ def build_index_now():
     with open(INDEX_META, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # Index-Bau-Datum speichern
     with open(INDEX_INFO, "w", encoding="utf-8") as f:
         json.dump({"built_at": datetime.now().isoformat()}, f)
 
@@ -141,7 +135,6 @@ with st.sidebar:
     if st.button("🔄 Index jetzt neu bauen"):
         with st.spinner("Baue Wissensindex…"):
             E, META = build_index_now()
-            # Info neu laden
             _, _, INFO = load_index()
             if E is not None:
                 st.success(f"Index gebaut: {E.shape[0]} Chunks")
@@ -157,6 +150,11 @@ with st.sidebar:
         except Exception:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
 
+    # Chat-Reset-Button
+    if st.button("🗑️ Chat zurücksetzen"):
+        st.session_state.messages = []
+        st.rerun()
+
 # --- Suche & Antwort ---
 def retrieve(query: str, top_k: int = 4):
     if E is None or META is None:
@@ -166,8 +164,7 @@ def retrieve(query: str, top_k: int = 4):
     q = q / (np.linalg.norm(q) + 1e-10)
     sims = (E @ q)
     idx = np.argsort(-sims)[:top_k]
-    results = [{"score": float(sims[i]), **META[i]} for i in idx]
-    return results
+    return [{"score": float(sims[i]), **META[i]} for i in idx]
 
 def answer_with_context(question: str, passages: list[dict]) -> str:
     context_blocks = []
@@ -185,18 +182,20 @@ def answer_with_context(question: str, passages: list[dict]) -> str:
     msg = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user_msg}])
     return msg.content
 
-st.divider()
-frage = st.text_input("🔎 Deine Frage an die Wissensbasis")
-if st.button("Antwort holen") and frage.strip():
-    if E is None:
-        st.warning("Kein Index gefunden. Baue ihn in der Sidebar oder führe lokal `python build_db.py` aus.")
+# --- Chat mit Verlauf ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+st.subheader("💬 Chat")
+
+# Verlauf anzeigen
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        st.markdown(f"👤 **Du:** {msg['content']}")
     else:
-        with st.spinner("Suche relevante Passagen…"):
-            hits = retrieve(frage, top_k=4)
-        if not hits:
-            st.info("Keine Treffer in der Wissensbasis.")
-        else:
-            with st.expander("Gefundene Passagen / Quellen"):
+        st.markdown(f"🤖 **Agentiva:** {msg['content']}")
+        if msg.get("sources"):
+            with st.expander("📚 Quellen"):
                 built_at = INFO.get("built_at")
                 if built_at:
                     try:
@@ -204,8 +203,7 @@ if st.button("Antwort holen") and frage.strip():
                         st.caption(f"📅 Letzte Indexierung: {dt}")
                     except Exception:
                         st.caption(f"📅 Letzte Indexierung: {built_at}")
-                for h in hits:
-                    # Änderungsdatum pro Dokument
+                for h in msg["sources"]:
                     if h.get("last_modified"):
                         try:
                             doc_dt = datetime.fromtimestamp(h["last_modified"]).strftime("%Y-%m-%d")
@@ -217,8 +215,24 @@ if st.button("Antwort holen") and frage.strip():
                     st.markdown(
                         f"**{h['source']}** (Abschnitt {h['chunk_id']}, Score {h['score']:.3f}{when})"
                     )
+
+# Eingabe für neue Nachricht
+user_input = st.chat_input("Schreibe deine Frage...")
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    if E is None:
+        st.warning("Kein Index gefunden. Baue ihn in der Sidebar oder führe lokal `python build_db.py` aus.")
+    else:
+        with st.spinner("Suche relevante Passagen…"):
+            hits = retrieve(user_input, top_k=4)
+
+        if not hits:
+            answer = "Keine Treffer in der Wissensbasis."
+            st.session_state.messages.append({"role": "assistant", "content": answer, "sources": []})
+        else:
             with st.spinner("Formuliere Antwort…"):
-                out = answer_with_context(frage, hits)
-            st.success("Antwort:")
-            st.write(out)
-            st.caption("Antwort generiert mit Azure OpenAI (kontextbasiert aus deinen PDFs).")
+                out = answer_with_context(user_input, hits)
+            st.session_state.messages.append({"role": "assistant", "content": out, "sources": hits})
+
+    st.rerun()
