@@ -4,20 +4,26 @@ import numpy as np
 import streamlit as st
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 
-# --- Env Variablen / Secrets ---
+# --- Helper für Variablen ---
 def env(name, default=None):
-    # Streamlit Cloud: st.secrets bevorzugen, sonst os.getenv
-    return st.secrets.get(name, os.getenv(name, default))
+    """Hole Variablen zuerst aus st.secrets, sonst aus Umgebungsvariablen"""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
 
+# --- Azure Konfiguration ---
 AZURE_OPENAI_KEY = env("AZURE_OPENAI_KEY")
-AZURE_OPENAI_ENDPOINT = env("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_CHAT_DEPLOYMENT = env("AZURE_OPENAI_CHAT_DEPLOYMENT")        # z.B. "gpt-4o-mini"
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT = env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")  # z.B. "embedding_small"
+AZURE_OPENAI_ENDPOINT = env("AZURE_OPENAI_ENDPOINT")  # z.B. "https://<dein-resource-name>.openai.azure.com/"
+AZURE_OPENAI_CHAT_DEPLOYMENT = env("AZURE_OPENAI_CHAT_DEPLOYMENT")  # z.B. "gpt-4o-mini"
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")  # z.B. "embedding-small"
 AZURE_OPENAI_API_VERSION = env("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT:
+    st.error("❌ Azure OpenAI Key oder Endpoint fehlen – bitte in den Streamlit Secrets setzen.")
     st.stop()
 
+# --- Index-Dateien ---
 INDEX_DIR = "agentiva_db"
 INDEX_NPZ = os.path.join(INDEX_DIR, "index.npz")
 INDEX_META = os.path.join(INDEX_DIR, "metadaten.json")
@@ -54,22 +60,16 @@ def load_index():
     return None, None
 
 def build_index_now():
-    # Mini-Builder on the fly (reduziert, damit es auch in Cloud klappt)
     from pypdf import PdfReader
 
     def chunk_text(text: str, size: int = 1200, overlap: int = 200):
         text = " ".join(text.split())
-        chunks = []
-        start = 0
-        n = len(text)
+        chunks, start, n = [], 0, len(text)
         while start < n:
             end = min(start + size, n)
             chunks.append(text[start:end])
-            if end == n:
-                break
-            start = end - overlap
-            if start < 0:
-                start = 0
+            if end == n: break
+            start = max(0, end - overlap)
         return chunks
 
     pdfs = [os.path.join(UNTERLAGEN_DIR, p) for p in os.listdir(UNTERLAGEN_DIR) if p.lower().endswith(".pdf")]
@@ -86,15 +86,13 @@ def build_index_now():
             text = ""
         if not text.strip():
             continue
-        # ggf. Limit, um Cloud-kosten/zeit zu schonen:
         chunks = chunk_text(text, size=1200, overlap=200)[:300]
         for i, ch in enumerate(chunks):
             all_chunks.append(ch)
             meta.append({"source": os.path.basename(p), "chunk_id": i, "text": ch})
 
     # Embeddings in Batches
-    vecs = []
-    BATCH = 64
+    vecs, BATCH = [], 64
     for i in range(0, len(all_chunks), BATCH):
         batch = all_chunks[i:i+BATCH]
         vecs.extend(emb.embed_documents(batch))
@@ -128,18 +126,14 @@ def retrieve(query: str, top_k: int = 4):
     q = emb.embed_query(query)
     q = np.array(q, dtype=np.float32)
     q = q / (np.linalg.norm(q) + 1e-10)
-    sims = (E @ q)  # cosine, da normalisiert
+    sims = (E @ q)  # cosine similarity
     idx = np.argsort(-sims)[:top_k]
-    results = [{"score": float(sims[i]), **META[i]} for i in idx]
-    return results
+    return [{"score": float(sims[i]), **META[i]} for i in idx]
 
 def answer_with_context(question: str, passages: list[dict]) -> str:
-    context_blocks = []
-    for p in passages:
-        context_blocks.append(
-            f"[{p['source']} • Abschnitt {p['chunk_id']}] {p['text'][:1200]}"
-        )
-    context = "\n\n".join(context_blocks)
+    context = "\n\n".join(
+        f"[{p['source']} • Abschnitt {p['chunk_id']}] {p['text'][:1200]}" for p in passages
+    )
     system = (
         "Du bist ein Assistent für Marketing- und Vertriebsunterlagen in Versicherungen. "
         "Antworte ausschließlich auf Basis der bereitgestellten Kontexte. "
