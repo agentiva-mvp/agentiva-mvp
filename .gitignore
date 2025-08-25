@@ -12,3 +12,9 @@
 .venv/
 .DS_Store
 **/.DS_Store
+.env
+.env.*
+.envrc
+.venv/
+.DS_Store
+**/.DS_Store
