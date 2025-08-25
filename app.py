@@ -22,7 +22,7 @@ if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT:
 INDEX_DIR = "agentiva_db"
 INDEX_NPZ = os.path.join(INDEX_DIR, "index.npz")
 INDEX_META = os.path.join(INDEX_DIR, "metadaten.json")
-INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")  # <<<<<< hinzugefügt
+INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")  # extra für Index-Zeitpunkt
 UNTERLAGEN_DIR = "unterlagen"
 
 st.set_page_config(page_title="Agentiva – Marketing-Lotse", page_icon="🧭", layout="wide")
@@ -59,6 +59,9 @@ def load_index():
                     info = json.load(f)
             except Exception:
                 info = {}
+        # Fallback: alte Indexe ohne last_modified ergänzen
+        for m in M:
+            m.setdefault("last_modified", None)
         return E, M, info
     return None, None, {}
 
@@ -88,7 +91,6 @@ def build_index_now():
     all_chunks, meta = [], []
     for p in pdfs:
         try:
-            from pypdf import PdfReader
             reader = PdfReader(p)
             text = "\n".join([page.extract_text() or "" for page in reader.pages])
         except Exception:
@@ -203,7 +205,18 @@ if st.button("Antwort holen") and frage.strip():
                     except Exception:
                         st.caption(f"📅 Letzte Indexierung: {built_at}")
                 for h in hits:
-                    st.markdown(f"**{h['source']}** (Abschnitt {h['chunk_id']}, Score {h['score']:.3f})")
+                    # Änderungsdatum pro Dokument
+                    if h.get("last_modified"):
+                        try:
+                            doc_dt = datetime.fromtimestamp(h["last_modified"]).strftime("%Y-%m-%d")
+                            when = f", geändert: {doc_dt}"
+                        except Exception:
+                            when = ""
+                    else:
+                        when = ""
+                    st.markdown(
+                        f"**{h['source']}** (Abschnitt {h['chunk_id']}, Score {h['score']:.3f}{when})"
+                    )
             with st.spinner("Formuliere Antwort…"):
                 out = answer_with_context(frage, hits)
             st.success("Antwort:")
