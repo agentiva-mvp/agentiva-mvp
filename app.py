@@ -142,6 +142,7 @@ with st.sidebar:
                 st.error("Index konnte nicht gebaut werden.")
     if E is not None:
         st.info(f"Aktiver Index: {E.shape[0]} Chunks")
+
     built_at = INFO.get("built_at")
     if built_at:
         try:
@@ -149,6 +150,20 @@ with st.sidebar:
             st.caption(f"📅 Index zuletzt aktualisiert: {dt}")
         except Exception:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
+
+    # --- Download-Buttons für den fertigen Index (NEU) ---
+    st.markdown("**📥 Index-Dateien herunterladen**")
+    if os.path.exists(INDEX_NPZ):
+        with open(INDEX_NPZ, "rb") as f:
+            st.download_button("index.npz herunterladen", f, file_name="index.npz", key="dl_npz")
+    if os.path.exists(INDEX_META):
+        with open(INDEX_META, "rb") as f:
+            st.download_button("metadaten.json herunterladen", f, file_name="metadaten.json", key="dl_meta")
+    if os.path.exists(INDEX_INFO):
+        with open(INDEX_INFO, "rb") as f:
+            st.download_button("index_info.json herunterladen", f, file_name="index_info.json", key="dl_info")
+
+    st.divider()
 
     # Chat-Reset-Button
     if st.button("🗑️ Chat zurücksetzen"):
