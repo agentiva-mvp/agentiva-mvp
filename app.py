@@ -59,7 +59,6 @@ def load_index():
                     info = json.load(f)
             except Exception:
                 info = {}
-        # Fallback für alte Indexe
         for m in M:
             m.setdefault("last_modified", None)
         return E, M, info
@@ -88,6 +87,7 @@ def build_index_now():
     all_chunks, meta = [], []
     for p in pdfs:
         try:
+            from pypdf import PdfReader
             reader = PdfReader(p)
             text = "\n".join([page.extract_text() or "" for page in reader.pages])
         except Exception:
@@ -110,7 +110,6 @@ def build_index_now():
                 "last_modified": mtime,
             })
 
-    # Embeddings in Batches
     vecs, BATCH = [], 64
     for i in range(0, len(all_chunks), BATCH):
         batch = all_chunks[i:i+BATCH]
@@ -133,7 +132,7 @@ E, META, INFO = load_index()
 with st.sidebar:
     st.subheader("⚙️ Index-Verwaltung")
 
-    # 👉 Button nur zeigen, wenn KEIN Index vorhanden ist
+    # Button nur anzeigen, wenn KEIN Index existiert
     if E is None:
         if st.button("🔄 Index jetzt neu bauen"):
             with st.spinner("Baue Wissensindex…"):
@@ -146,7 +145,6 @@ with st.sidebar:
     else:
         st.info(f"Aktiver Index: {E.shape[0]} Chunks")
 
-    # Index-Datum
     built_at = INFO.get("built_at")
     if built_at:
         try:
@@ -155,21 +153,9 @@ with st.sidebar:
         except Exception:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
 
-    # Downloads des fertigen Index (praktisch für Möglichkeit 1)
-    st.markdown("**📥 Index-Dateien herunterladen**")
-    if os.path.exists(INDEX_NPZ):
-        with open(INDEX_NPZ, "rb") as f:
-            st.download_button("index.npz herunterladen", f, file_name="index.npz", key="dl_npz")
-    if os.path.exists(INDEX_META):
-        with open(INDEX_META, "rb") as f:
-            st.download_button("metadaten.json herunterladen", f, file_name="metadaten.json", key="dl_meta")
-    if os.path.exists(INDEX_INFO):
-        with open(INDEX_INFO, "rb") as f:
-            st.download_button("index_info.json herunterladen", f, file_name="index_info.json", key="dl_info")
-
     st.divider()
 
-    # Chat-Reset-Button
+    # Chat zurücksetzen
     if st.button("🗑️ Chat zurücksetzen"):
         st.session_state.messages = []
         st.rerun()
@@ -207,7 +193,6 @@ if "messages" not in st.session_state:
 
 st.subheader("💬 Chat")
 
-# Verlauf anzeigen
 for msg in st.session_state.messages:
     if msg["role"] == "user":
         st.markdown(f"👤 **Du:** {msg['content']}")
@@ -235,7 +220,6 @@ for msg in st.session_state.messages:
                         f"**{h['source']}** (Abschnitt {h['chunk_id']}, Score {h['score']:.3f}{when})"
                     )
 
-# Eingabe für neue Nachricht
 user_input = st.chat_input("Schreibe deine Frage...")
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
