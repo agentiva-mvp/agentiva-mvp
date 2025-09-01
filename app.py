@@ -20,7 +20,7 @@ if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT:
     st.stop()
 
 INDEX_DIR = "agentiva_db"
-INDEX_NPZ = os.path.join(INDEX_DIR, "index.npz")
+INDEX_NPZ  = os.path.join(INDEX_DIR, "index.npz")
 INDEX_META = os.path.join(INDEX_DIR, "metadaten.json")
 INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")
 UNTERLAGEN_DIR = "unterlagen"
@@ -59,6 +59,7 @@ def load_index():
                     info = json.load(f)
             except Exception:
                 info = {}
+        # Fallback für alte Indexe
         for m in M:
             m.setdefault("last_modified", None)
         return E, M, info
@@ -70,8 +71,7 @@ def build_index_now():
     def chunk_text(text: str, size: int = 1200, overlap: int = 200):
         text = " ".join(text.split())
         chunks = []
-        start = 0
-        n = len(text)
+        start, n = 0, len(text)
         while start < n:
             end = min(start + size, n)
             chunks.append(text[start:end])
@@ -110,8 +110,8 @@ def build_index_now():
                 "last_modified": mtime,
             })
 
-    vecs = []
-    BATCH = 64
+    # Embeddings in Batches
+    vecs, BATCH = [], 64
     for i in range(0, len(all_chunks), BATCH):
         batch = all_chunks[i:i+BATCH]
         vecs.extend(emb.embed_documents(batch))
@@ -132,17 +132,21 @@ E, META, INFO = load_index()
 
 with st.sidebar:
     st.subheader("⚙️ Index-Verwaltung")
-    if st.button("🔄 Index jetzt neu bauen"):
-        with st.spinner("Baue Wissensindex…"):
-            E, META = build_index_now()
-            _, _, INFO = load_index()
-            if E is not None:
-                st.success(f"Index gebaut: {E.shape[0]} Chunks")
-            else:
-                st.error("Index konnte nicht gebaut werden.")
-    if E is not None:
+
+    # 👉 Button nur zeigen, wenn KEIN Index vorhanden ist
+    if E is None:
+        if st.button("🔄 Index jetzt neu bauen"):
+            with st.spinner("Baue Wissensindex…"):
+                E, META = build_index_now()
+                _, _, INFO = load_index()
+                if E is not None:
+                    st.success(f"Index gebaut: {E.shape[0]} Chunks")
+                else:
+                    st.error("Index konnte nicht gebaut werden.")
+    else:
         st.info(f"Aktiver Index: {E.shape[0]} Chunks")
 
+    # Index-Datum
     built_at = INFO.get("built_at")
     if built_at:
         try:
@@ -151,7 +155,7 @@ with st.sidebar:
         except Exception:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
 
-    # --- Download-Buttons für den fertigen Index (NEU) ---
+    # Downloads des fertigen Index (praktisch für Möglichkeit 1)
     st.markdown("**📥 Index-Dateien herunterladen**")
     if os.path.exists(INDEX_NPZ):
         with open(INDEX_NPZ, "rb") as f:
