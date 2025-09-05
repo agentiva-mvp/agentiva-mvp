@@ -7,13 +7,12 @@ from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 
 # --- Env Variablen / Secrets ---
 def env(name, default=None):
-    # Streamlit Cloud: st.secrets bevorzugen, sonst os.getenv
     return st.secrets.get(name, os.getenv(name, default))
 
 AZURE_OPENAI_KEY = env("AZURE_OPENAI_KEY")
 AZURE_OPENAI_ENDPOINT = env("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_CHAT_DEPLOYMENT = env("AZURE_OPENAI_CHAT_DEPLOYMENT")        # z.B. "gpt-4o-mini"
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT = env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")  # z.B. "embedding_small"
+AZURE_OPENAI_CHAT_DEPLOYMENT = env("AZURE_OPENAI_CHAT_DEPLOYMENT")
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = env("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
 AZURE_OPENAI_API_VERSION = env("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 if not AZURE_OPENAI_KEY or not AZURE_OPENAI_ENDPOINT:
@@ -45,6 +44,28 @@ emb = AzureOpenAIEmbeddings(
     api_version=AZURE_OPENAI_API_VERSION,
 )
 
+# --- Manifest-Funktionen ---
+def file_manifest(root: str) -> dict:
+    """Erzeuge ein Manifest {filename: {size, mtime}} für alle PDFs."""
+    manifest = {}
+    if not os.path.isdir(root):
+        return manifest
+    for name in os.listdir(root):
+        if not name.lower().endswith(".pdf"):
+            continue
+        p = os.path.join(root, name)
+        try:
+            st_ = os.stat(p)
+            manifest[name] = {"size": st_.st_size, "mtime": st_.st_mtime}
+        except Exception:
+            continue
+    return manifest
+
+def is_index_stale(info: dict, current: dict) -> bool:
+    """Vergleicht gespeichertes Manifest (in index_info.json) mit aktuellem."""
+    saved = (info or {}).get("files", {})
+    return saved != current
+
 # --- Index laden/aufbauen ---
 def load_index():
     if os.path.exists(INDEX_NPZ) and os.path.exists(INDEX_META):
@@ -69,8 +90,7 @@ def build_index_now():
 
     def chunk_text(text: str, size: int = 1200, overlap: int = 200):
         text = " ".join(text.split())
-        chunks = []
-        start, n = 0, len(text)
+        chunks, start, n = [], 0, len(text)
         while start < n:
             end = min(start + size, n)
             chunks.append(text[start:end])
@@ -87,14 +107,12 @@ def build_index_now():
     all_chunks, meta = [], []
     for p in pdfs:
         try:
-            from pypdf import PdfReader
             reader = PdfReader(p)
             text = "\n".join([page.extract_text() or "" for page in reader.pages])
         except Exception:
             text = ""
         if not text.strip():
             continue
-
         try:
             mtime = os.path.getmtime(p)
         except Exception:
@@ -110,6 +128,7 @@ def build_index_now():
                 "last_modified": mtime,
             })
 
+    # Embeddings in Batches
     vecs, BATCH = [], 64
     for i in range(0, len(all_chunks), BATCH):
         batch = all_chunks[i:i+BATCH]
@@ -122,27 +141,28 @@ def build_index_now():
     with open(INDEX_META, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
+    # Manifest + Zeitstempel speichern
+    current = file_manifest(UNTERLAGEN_DIR)
     with open(INDEX_INFO, "w", encoding="utf-8") as f:
-        json.dump({"built_at": datetime.now().isoformat()}, f)
+        json.dump({
+            "built_at": datetime.now().isoformat(),
+            "files": current
+        }, f)
 
     return E, meta
 
+# --- Index laden & Auto-Reindex ---
 E, META, INFO = load_index()
+current = file_manifest(UNTERLAGEN_DIR)
+if (E is None) or is_index_stale(INFO, current):
+    with st.spinner("Änderungen in 'unterlagen/' erkannt – baue Index neu…"):
+        E, META = build_index_now()
+        _, _, INFO = load_index()
 
+# --- Sidebar ---
 with st.sidebar:
-    st.subheader("⚙️ Index-Verwaltung")
-
-    # Button nur anzeigen, wenn KEIN Index existiert
-    if E is None:
-        if st.button("🔄 Index jetzt neu bauen"):
-            with st.spinner("Baue Wissensindex…"):
-                E, META = build_index_now()
-                _, _, INFO = load_index()
-                if E is not None:
-                    st.success(f"Index gebaut: {E.shape[0]} Chunks")
-                else:
-                    st.error("Index konnte nicht gebaut werden.")
-    else:
+    st.subheader("⚙️ Index")
+    if E is not None:
         st.info(f"Aktiver Index: {E.shape[0]} Chunks")
 
     built_at = INFO.get("built_at")
@@ -154,8 +174,6 @@ with st.sidebar:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
 
     st.divider()
-
-    # Chat zurücksetzen
     if st.button("🗑️ Chat zurücksetzen"):
         st.session_state.messages = []
         st.rerun()
@@ -174,9 +192,7 @@ def retrieve(query: str, top_k: int = 4):
 def answer_with_context(question: str, passages: list[dict]) -> str:
     context_blocks = []
     for p in passages:
-        context_blocks.append(
-            f"[{p['source']} • Abschnitt {p['chunk_id']}] {p['text'][:1200]}"
-        )
+        context_blocks.append(f"[{p['source']} • Abschnitt {p['chunk_id']}] {p['text'][:1200]}")
     context = "\n\n".join(context_blocks)
     system = (
         "Du bist ein Assistent für Marketing- und Vertriebsunterlagen in Versicherungen. "
@@ -187,7 +203,7 @@ def answer_with_context(question: str, passages: list[dict]) -> str:
     msg = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user_msg}])
     return msg.content
 
-# --- Chat mit Verlauf ---
+# --- Chat ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -208,14 +224,13 @@ for msg in st.session_state.messages:
                     except Exception:
                         st.caption(f"📅 Letzte Indexierung: {built_at}")
                 for h in msg["sources"]:
+                    when = ""
                     if h.get("last_modified"):
                         try:
                             doc_dt = datetime.fromtimestamp(h["last_modified"]).strftime("%Y-%m-%d")
                             when = f", geändert: {doc_dt}"
                         except Exception:
-                            when = ""
-                    else:
-                        when = ""
+                            pass
                     st.markdown(
                         f"**{h['source']}** (Abschnitt {h['chunk_id']}, Score {h['score']:.3f}{when})"
                     )
@@ -225,7 +240,7 @@ if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
 
     if E is None:
-        st.warning("Kein Index gefunden. Baue ihn in der Sidebar oder führe lokal `python build_db.py` aus.")
+        st.warning("Kein Index gefunden.")
     else:
         with st.spinner("Suche relevante Passagen…"):
             hits = retrieve(user_input, top_k=4)
