@@ -24,9 +24,9 @@ INDEX_META = os.path.join(INDEX_DIR, "metadaten.json")
 INDEX_INFO = os.path.join(INDEX_DIR, "index_info.json")
 UNTERLAGEN_DIR = "unterlagen"
 
-st.set_page_config(page_title="Agentiva – Marketing-Lotse", page_icon="🧭", layout="wide")
-st.title("🤖 Agentiva – KI-Agent für den Marketing-Dschungel")
-st.caption("Antwortet faktenbasiert aus den PDFs im Ordner ‘unterlagen’. (NumPy-Index, Cloud-freundlich)")
+st.set_page_config(page_title="Agentiva – Wissenslotse", page_icon="🧭", layout="wide")
+st.title("🤖 Agentiva – Ihr Wissenslotse")
+st.caption("Antwortet faktenbasiert aus den PDFs im Ordner ‘unterlagen’. und schlägt Ansprechpartner vor, wenn Antworten nicht eindeutig sind.")
 
 # --- Azure Clients ---
 llm = AzureChatOpenAI(
@@ -46,7 +46,6 @@ emb = AzureOpenAIEmbeddings(
 
 # --- Manifest-Funktionen ---
 def file_manifest(root: str) -> dict:
-    """Erzeuge ein Manifest {filename: {size, mtime}} für alle PDFs."""
     manifest = {}
     if not os.path.isdir(root):
         return manifest
@@ -62,7 +61,6 @@ def file_manifest(root: str) -> dict:
     return manifest
 
 def is_index_stale(info: dict, current: dict) -> bool:
-    """Vergleicht gespeichertes Manifest (in index_info.json) mit aktuellem."""
     saved = (info or {}).get("files", {})
     return saved != current
 
@@ -141,7 +139,6 @@ def build_index_now():
     with open(INDEX_META, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    # Manifest + Zeitstempel speichern
     current = file_manifest(UNTERLAGEN_DIR)
     with open(INDEX_INFO, "w", encoding="utf-8") as f:
         json.dump({
@@ -194,12 +191,19 @@ def answer_with_context(question: str, passages: list[dict]) -> str:
     for p in passages:
         context_blocks.append(f"[{p['source']} • Abschnitt {p['chunk_id']}] {p['text'][:1200]}")
     context = "\n\n".join(context_blocks)
+
     system = (
-        "Du bist ein Assistent für Marketing- und Vertriebsunterlagen in Versicherungen. "
-        "Antworte ausschließlich auf Basis der bereitgestellten Kontexte. "
-        "Wenn die Antwort nicht sicher aus den Quellen hervorgeht, sage ehrlich, dass es nicht eindeutig ist."
+        "Du bist Agentiva, ein Wissenslotse: ein KI-Assistent, der Anwendern hilft, Antworten in komplexen Dokumenten zu finden. "
+        "Antworte stets faktenbasiert und klar in deutscher Sprache. "
+        "Dein Ziel ist es, dem Nutzer so gut wie möglich eine finale, hilfreiche Antwort zu geben. "
+        "Wenn die Antwort nicht eindeutig aus den bereitgestellten Kontexten hervorgeht, prüfe, ob im Kontext Ansprechpartner, "
+        "Kontaktdaten oder Zuständigkeiten genannt sind. "
+        "Falls ja, schlage diese als Ansprechpartner vor. "
+        "Wenn keine Ansprechpartner genannt sind, sage ehrlich, dass im Dokument keine passenden Ansprechpartner gefunden wurden."
     )
+
     user_msg = f"Frage:\n{question}\n\nKontexte:\n{context}"
+
     msg = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user_msg}])
     return msg.content
 
@@ -246,7 +250,7 @@ if user_input:
             hits = retrieve(user_input, top_k=4)
 
         if not hits:
-            answer = "Keine Treffer in der Wissensbasis."
+            answer = "Keine Treffer in der Wissensbasis. Im Dokument wurden keine Ansprechpartner gefunden."
             st.session_state.messages.append({"role": "assistant", "content": answer, "sources": []})
         else:
             with st.spinner("Formuliere Antwort…"):
