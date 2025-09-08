@@ -66,7 +66,7 @@ UNTERLAGEN_DIR = "unterlagen"
 
 st.set_page_config(page_title="Agentiva – Wissenslotse", page_icon="🧭", layout="wide")
 st.title("🤖 Agentiva – Ihr Wissenslotse")
-st.caption("Antwortet faktenbasiert aus PDFs. Wenn keine sichere Antwort möglich ist, formuliert Agentiva im Chat eine Anfrage und öffnet dein Mailprogramm vorbefüllt.")
+st.caption("Antwortet faktenbasiert aus PDFs. Fallback formuliert im Chat eine Anfrage und öffnet dein Mailprogramm vorbefüllt. Quellen (Mini-Snippets + Deeplink) nur bei starken Treffern.")
 
 # ---------- Azure Clients ----------
 llm = AzureChatOpenAI(
@@ -171,9 +171,26 @@ def build_index_now():
     return E, meta, contacts
 
 E, META, CONTACTS = load_index()
-if E is None:
-    with st.spinner("Baue Wissensindex…"):
-        E, META, CONTACTS = build_index_now()
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.subheader("⚙️ Index & Diagnose")
+    if E is not None:
+        st.success(f"Aktiver Index: {len(META)} Chunks")
+    else:
+        st.warning("Kein Index geladen.")
+
+    if st.button("🔄 Index jetzt neu bauen"):
+        with st.spinner("Baue Wissensindex…"):
+            E, META, CONTACTS = build_index_now()
+            if E is not None: st.success(f"Index gebaut: {len(META)} Chunks")
+            else: st.error("Index konnte nicht gebaut werden.")
+
+    st.divider()
+    DEBUG = st.checkbox("🔍 Debug-Modus (Scores anzeigen)", value=False)
+
+    if st.button("🗑️ Chat zurücksetzen"):
+        st.session_state.clear()
+        st.rerun()
 
 # ---------- Retrieval ----------
 def pdf_hits(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
@@ -191,12 +208,64 @@ def pdf_hits(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
 
 # ---------- Fallback-Entscheidung ----------
 FALLBACK_MIN_SIM = float(env("FALLBACK_MIN_SIM", "0.35"))
-FALLBACK_MIN_GOOD = int(env("FALLBACK_MIN_GOOD", "2"))
+FALLBACK_MIN_GOOD = int(env("FALLBACK_MIN_GOOD", "1"))
 
 def should_fallback(hits: List[Dict[str, Any]]) -> bool:
     if not hits: return True
     good = sum(1 for h in hits if h["score"] >= FALLBACK_MIN_SIM)
     return good < FALLBACK_MIN_GOOD
+
+# ---------- Auto-Contact-Ranking ----------
+def pick_best_contact(question: str, thema: str, kontext: str) -> Dict[str, Any] | None:
+    if not CONTACTS:
+        return None
+    query_text = " ".join([question or "", thema or "", kontext or ""]).strip()
+    if not query_text:
+        query_text = question or thema or kontext or ""
+    q_emb = np.array(emb.embed_query(query_text), dtype=np.float32)
+    q_emb /= (np.linalg.norm(q_emb) + 1e-10)
+
+    best = None
+    best_score = -1.0
+    for c in CONTACTS:
+        snippets = c.get("snippets", [])[:3]
+        if not snippets: continue
+        joined = " ".join(s.get("snippet","") for s in snippets)
+        doc_emb = np.array(emb.embed_documents([joined])[0], dtype=np.float32)
+        doc_emb /= (np.linalg.norm(doc_emb) + 1e-10)
+        score = float(doc_emb @ q_emb)
+        if score > best_score:
+            best_score = score
+            best = {"email": c["email"], "score": score, "snippets": snippets}
+    return best
+
+# ---------- Antwortgenerator ----------
+def answer_with_context(question: str, passages: List[Dict[str, Any]]) -> str:
+    blocks = []
+    for p in passages:
+        blocks.append(f"[{p['source']} • Seite {p['page']}] {p['text'][:300]}")
+    context = "\n\n".join(blocks)
+
+    system = (
+        "Du bist Agentiva, ein Wissenslotse. Antworte faktenbasiert aus den bereitgestellten Kontexten, "
+        "knapp, klar und in deutscher Sprache."
+    )
+    user_msg = f"Frage:\n{question}\n\nKontexte:\n{context}"
+    msg = llm.invoke([{"role":"system","content":system},{"role":"user","content":user_msg}])
+    return msg.content
+
+def make_email_draft(question: str, details: dict) -> dict:
+    subject = details.get("thema") or f"Klärungsanfrage: {question[:40]}"
+    body = (
+        f"Hallo,\n\n"
+        f"ich habe eine Frage zu: {details.get('thema','(Thema)')}\n\n"
+        f"Hintergrund:\n{details.get('kontext','')}\n\n"
+        f"Meine konkrete Frage:\n{question}\n\n"
+        f"Erwartetes Ergebnis/Ziel:\n{details.get('ziel','')}\n"
+        f"Frist/Zeitpunkt: {details.get('frist','')}\n\n"
+        f"Vielen Dank!\n"
+    )
+    return {"subject": subject, "body": body}
 
 # ---------- Session State ----------
 if "messages" not in st.session_state:
@@ -209,6 +278,8 @@ if "await_snippet_confirm" not in st.session_state:
     st.session_state.await_snippet_confirm = False
 if "last_hits" not in st.session_state:
     st.session_state.last_hits = []
+if "suggested_contact" not in st.session_state:
+    st.session_state.suggested_contact = None
 
 # ---------- Chat UI ----------
 st.subheader("💬 Chat")
@@ -220,7 +291,7 @@ for msg in st.session_state.messages:
 
 user_input = st.chat_input("Schreibe deine Frage…")
 
-# ---------- Snippet-Handler ----------
+# ---------- Snippet-Handler (nur bei starken Treffern) ----------
 if user_input and st.session_state.await_snippet_confirm:
     st.session_state.await_snippet_confirm = False
     st.session_state.messages.append({"role":"user","content":user_input})
@@ -241,9 +312,111 @@ if user_input and st.session_state.await_snippet_confirm:
     st.rerun()
 
 # ---------- Hauptlogik ----------
+def handle_fallback_dialog(user_input: str):
+    step = st.session_state.fallback_step
+    data = st.session_state.fallback_data
+
+    if step == "ask_consent":
+        if user_input.lower() in {"ja","yes","ok","okay","gern"}:
+            st.session_state.fallback_step = "ask_thema"
+            return {"role":"assistant","content":"Alles klar. Worum geht es genau (Thema)?"}
+        else:
+            st.session_state.fallback_step = None
+            return {"role":"assistant","content":"Verstanden, dann belassen wir es dabei."}
+
+    elif step == "ask_thema":
+        data["thema"] = user_input
+        st.session_state.fallback_step = "ask_ziel"
+        return {"role":"assistant","content":"Danke. Was soll mit der Anfrage erreicht werden (Ziel/Ergebnis)?"}
+
+    elif step == "ask_ziel":
+        data["ziel"] = user_input
+        st.session_state.fallback_step = "ask_frist"
+        return {"role":"assistant","content":"Gut. Gibt es eine Frist oder einen Termin?"}
+
+    elif step == "ask_frist":
+        data["frist"] = user_input
+        st.session_state.fallback_step = "ask_kontext"
+        return {"role":"assistant","content":"Noch kurz: gibt es einen Kontext/Hintergrund, den ich erwähnen soll?"}
+
+    elif step == "ask_kontext":
+        data["kontext"] = user_input
+        # automatischer Ansprechpartner-Vorschlag
+        best = pick_best_contact(
+            question=data.get("original_question",""),
+            thema=data.get("thema",""),
+            kontext=data.get("kontext","")
+        )
+        st.session_state.suggested_contact = best
+        st.session_state.fallback_step = "confirm_contact"
+
+        if best:
+            details = ""
+            for s in best.get("snippets", [])[:2]:
+                details += f"- {s.get('source','')} (S. {s.get('page','?')})\n"
+            return {"role":"assistant",
+                    "content": f"Ich schlage **{best['email']}** als Ansprechpartner vor.\n"
+                               f"Bezug aus den Unterlagen:\n{details or '-'}\n\n"
+                               "Passt das? Antworte mit **ja**, **nein** oder gib eine andere E-Mail an."}
+        else:
+            return {"role":"assistant",
+                    "content":"Ich habe keinen Ansprechpartner in den Unterlagen erkannt. "
+                             "Bitte gib eine E-Mail-Adresse an oder schreibe **nein** zum Abbrechen."}
+
+    elif step == "confirm_contact":
+        txt = user_input.strip()
+        best = st.session_state.suggested_contact
+        if txt.lower() in {"ja","yes","ok","okay","passt"} and best:
+            data["recipient"] = best["email"]
+        elif "@" in txt:
+            data["recipient"] = txt
+        else:
+            st.session_state.fallback_step = None
+            st.session_state.suggested_contact = None
+            return {"role":"assistant","content":"Okay, kein Versand. Du kannst später erneut fragen."}
+
+        st.session_state.fallback_step = "done"
+        draft = make_email_draft(data.get("original_question",""), data)
+        st.session_state.fallback_data["draft"] = draft
+        return {"role":"assistant",
+                "content": f"Fertig! Soll ich die E-Mail an **{data['recipient']}** vorbereiten? "
+                           "Antworte mit **ja** oder **nein**."}
+
+    elif step == "done":
+        if user_input.lower() in {"ja","yes","ok","okay"}:
+            draft = data.get("draft")
+            to_addr = data.get("recipient","kontakt@example.com")
+            mailto_url = build_mailto(to=to_addr, subject=draft["subject"], body=draft["body"])
+            st.session_state.fallback_step = None
+            st.session_state.suggested_contact = None
+            return {"role":"assistant","content": f"[📧 Im Mailprogramm öffnen]({mailto_url})"}
+        else:
+            st.session_state.fallback_step = None
+            st.session_state.suggested_contact = None
+            return {"role":"assistant","content":"Alles klar, kein Versand."}
+
 if user_input and not st.session_state.await_snippet_confirm:
     st.session_state.messages.append({"role":"user","content":user_input})
+
+    # Wenn wir mitten im Fallback-Dialog sind, zuerst den bedienen
+    if st.session_state.fallback_step:
+        reply = handle_fallback_dialog(user_input)
+        st.session_state.messages.append(reply)
+        st.rerun()
+
+    # Sonst regulär versuchen zu beantworten
+    if E is None:
+        st.session_state.messages.append({"role":"assistant","content":"Kein Index gefunden. Baue den Index in der Sidebar neu."})
+        st.rerun()
+
     hits = pdf_hits(user_input, top_k=4)
+
+    # Debug: Scores zeigen
+    if DEBUG:
+        debug_lines = "\n".join([f"- {h['source']} S.{h['page']} | Score: {h['score']:.3f}" for h in hits])
+        st.session_state.messages.append({"role":"assistant","content":"**Debug – Treffer & Scores:**\n" + debug_lines})
+
+    # Fallback?
     if should_fallback(hits):
         st.session_state.fallback_step = "ask_consent"
         st.session_state.fallback_data = {"original_question": user_input}
@@ -253,19 +426,31 @@ if user_input and not st.session_state.await_snippet_confirm:
                       "Soll ich dir helfen, eine Anfrage zu formulieren?"
         })
         st.rerun()
-    else:
-        strong = [h for h in hits if h["score"] >= FALLBACK_MIN_SIM]
-        blocks = "\n\n".join([f"[{h['source']} • Seite {h['page']}] {h['text'][:300]}" for h in strong])
-        system = "Du bist ein Assistent, der faktenbasiert aus den Dokumenten antwortet."
-        user_msg = f"Frage:\n{user_input}\n\nKontexte:\n{blocks}"
-        msg = llm.invoke([{"role":"system","content":system},{"role":"user","content":user_msg}])
-        st.session_state.messages.append({"role":"assistant","content":msg.content})
 
-        # Nachfrage Quellen
+    # Starke Treffer → antworten + Quellen optional
+    strong = [h for h in hits if h["score"] >= FALLBACK_MIN_SIM]
+    if not strong:
+        # Sicherheitsnetz: wenn strong leer, trotzdem Fallback
+        st.session_state.fallback_step = "ask_consent"
+        st.session_state.fallback_data = {"original_question": user_input}
         st.session_state.messages.append({
             "role":"assistant",
-            "content":"Möchtest du die entsprechenden Stellen im Original sehen? Antworte mit **ja**.",
+            "content":"Ich finde keine eindeutige Antwort in den Dokumenten. "
+                      "Soll ich dir helfen, eine Anfrage zu formulieren?"
         })
-        st.session_state.await_snippet_confirm = True
-        st.session_state.last_hits = strong
         st.rerun()
+
+    blocks = "\n\n".join([f"[{h['source']} • Seite {h['page']}] {h['text'][:300]}" for h in strong])
+    system = "Du bist ein Assistent, der faktenbasiert aus den Dokumenten antwortet."
+    user_msg = f"Frage:\n{user_input}\n\nKontexte:\n{blocks}"
+    msg = llm.invoke([{"role":"system","content":system},{"role":"user","content":user_msg}])
+    st.session_state.messages.append({"role":"assistant","content":msg.content})
+
+    # Nachfrage Quellen
+    st.session_state.messages.append({
+        "role":"assistant",
+        "content":"Möchtest du die entsprechenden Stellen im Original sehen? Antworte mit **ja**.",
+    })
+    st.session_state.await_snippet_confirm = True
+    st.session_state.last_hits = strong
+    st.rerun()
