@@ -1,5 +1,5 @@
 # app.py
-import os, json
+import os, json, re
 import numpy as np
 import streamlit as st
 from datetime import datetime
@@ -7,14 +7,22 @@ from typing import List, Dict, Any
 from urllib.parse import quote, quote_plus
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 
-# ---------- Helper ----------
+# ---------- Helpers ----------
 def env(name, default=None):
     return st.secrets.get(name, os.getenv(name, default))
 
-def boolish(x: str | None) -> bool:
-    if x is None:
-        return False
-    return x.strip().lower() in {"1", "true", "yes", "y", "ja"}
+def build_mailto(to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> str:
+    """Baut einen mailto:-Link, der den lokalen Mail-Client des Nutzers öffnet."""
+    def enc(x: str) -> str:
+        return quote(x or "")
+    to_enc = enc(to or "")
+    q = []
+    if subject: q.append(f"subject={enc(subject)}")
+    if body:    q.append(f"body={enc(body)}")
+    if cc:      q.append(f"cc={enc(cc)}")
+    if bcc:     q.append(f"bcc={enc(bcc)}")
+    qs = "&".join(q)
+    return f"mailto:{to_enc}" + (f"?{qs}" if qs else "")
 
 # ---------- Azure / App Config ----------
 AZURE_OPENAI_KEY = env("AZURE_OPENAI_KEY")
@@ -39,7 +47,7 @@ UNTERLAGEN_DIR = "unterlagen"
 
 st.set_page_config(page_title="Agentiva – Wissenslotse", page_icon="🧭", layout="wide")
 st.title("🤖 Agentiva – Ihr Wissenslotse")
-st.caption("Antwortet faktenbasiert aus den PDFs im Ordner ‘unterlagen’. Zeigt auf Wunsch genaue Textausschnitte inkl. Deeplink ins Originaldokument (PDF.js).")
+st.caption("Antwortet faktenbasiert aus PDFs. Zeigt auf Wunsch Textausschnitte inkl. Deeplink ins Original (PDF.js). Fallback erstellt strukturierte E-Mails und öffnet dein Mailprogramm vorbefüllt.")
 
 # ---------- Azure Clients ----------
 llm = AzureChatOpenAI(
@@ -76,25 +84,20 @@ def file_manifest(root: str) -> dict:
 def is_index_stale(info: dict, current: dict) -> bool:
     return (info or {}).get("files", {}) != current
 
-# ---------- Deeplink-Builder (Variante: Mozilla PDF.js) ----------
+# ---------- Deeplink-Builder (Mozilla PDF.js) ----------
 def pdf_raw_url(filename: str, page: int | None = None) -> str:
     """
-    Baut einen Deeplink über den Mozilla PDF.js Viewer:
+    Deeplink via Mozilla PDF.js:
       https://mozilla.github.io/pdf.js/web/viewer.html?file=<RAW_URL>#page=N
-
-    Voraussetzungen:
-    - Öffentliches GitHub-Repo (damit PDF.js die Datei laden kann)
-    - GITHUB_OWNER / GITHUB_REPO / GITHUB_BRANCH gesetzt
+    Voraussetzungen: Öffentliches GitHub-Repo.
     """
     owner, repo, branch = GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH
     if not owner or not repo:
-        # Fallback: lokaler Pfad (funktioniert in Streamlit Cloud i. d. R. nicht klickbar)
         local = f"./unterlagen/{quote(filename, safe='')}"
         return f"{local}#page={page}" if page else local
-
     enc_file = quote(filename, safe="")
     raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/unterlagen/{enc_file}"
-    enc_raw = quote_plus(raw)  # als URL-Parameter für viewer?file=<...>
+    enc_raw = quote_plus(raw)
     url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={enc_raw}"
     return f"{url}#page={page}" if page else url
 
@@ -154,7 +157,7 @@ def build_index_now():
         except Exception:
             mtime = None
 
-        # seitenweises Chunking -> wir kennen die Seite für Deeplinks
+        # seitenweises Chunking -> saubere Seitenzahl für Deeplinks
         for page_idx, page in enumerate(reader.pages, start=1):
             try:
                 page_text = page.extract_text() or ""
@@ -206,12 +209,27 @@ if (E is None) or is_index_stale(INFO, current):
         E, META = build_index_now()
         _, _, INFO = load_index()
 
+# ---------- Kontakte aus PDFs extrahieren ----------
+def extract_contacts(meta: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    contacts = {}
+    email_re = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+    for m in meta or []:
+        text = m.get("text", "") or ""
+        for match in email_re.finditer(text):
+            email = match.group(0)
+            start = max(0, match.start() - 80)
+            snippet = text[start:match.end() + 40].replace("\n", " ").strip()
+            label = snippet if len(snippet) <= 120 else snippet[:120] + "…"
+            contacts[email] = {"email": email, "label": label, "source": m.get("source",""), "page": m.get("page")}
+    return list(contacts.values())
+
+CONTACTS = extract_contacts(META)
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.subheader("⚙️ Index")
     if E is not None:
         st.info(f"Aktiver Index: {E.shape[0]} Chunks")
-
     built_at = INFO.get("built_at")
     if built_at:
         try:
@@ -219,16 +237,14 @@ with st.sidebar:
             st.caption(f"📅 Index zuletzt aktualisiert: {dt}")
         except Exception:
             st.caption(f"📅 Index zuletzt aktualisiert: {built_at}")
-
     st.divider()
     if st.button("🗑️ Chat zurücksetzen"):
         st.session_state.clear()
         st.rerun()
 
 # ---------- Retrieval & Answering ----------
-def retrieve(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
-    if E is None or META is None:
-        return []
+def pdf_hits(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
+    if E is None or META is None: return []
     q = np.array(emb.embed_query(query), dtype=np.float32)
     q = q / (np.linalg.norm(q) + 1e-10)
     sims = (E @ q)
@@ -237,14 +253,12 @@ def retrieve(query: str, top_k: int = 4) -> List[Dict[str, Any]]:
     for i in idx:
         item = dict(META[i])
         item["score"] = float(sims[i])
-        # Deeplink-URL pro Treffer
         page = item.get("page")
         item["url"] = pdf_raw_url(item["source"], page)
         hits.append(item)
     return hits
 
 def answer_with_context(question: str, passages: List[Dict[str, Any]]) -> str:
-    # Kurzer Kontext an das LLM (Snippets on-demand im UI)
     blocks = []
     for p in passages:
         preview = p.get("text", "")[:900]
@@ -254,16 +268,37 @@ def answer_with_context(question: str, passages: List[Dict[str, Any]]) -> str:
 
     system = (
         "Du bist Agentiva, ein Wissenslotse: ein KI-Assistent, der Anwendern hilft, Antworten in komplexen Dokumenten zu finden. "
-        "Antworte stets faktenbasiert und klar in deutscher Sprache. "
+        "Antworte stets faktenbasiert und klar auf Deutsch. "
         "Dein Ziel ist es, dem Nutzer so gut wie möglich eine finale, hilfreiche Antwort zu geben. "
         "Wenn die Antwort nicht eindeutig aus den bereitgestellten Kontexten hervorgeht, prüfe, ob im Kontext Ansprechpartner, "
-        "Kontaktdaten oder Zuständigkeiten genannt sind. "
-        "Falls ja, schlage diese als Ansprechpartner vor. "
+        "Kontaktdaten oder Zuständigkeiten genannt sind. Falls ja, schlage diese als Ansprechpartner vor. "
         "Wenn keine Ansprechpartner genannt sind, sage ehrlich, dass im Dokument keine passenden Ansprechpartner gefunden wurden."
     )
     user_msg = f"Frage:\n{question}\n\nKontexte:\n{context}"
     msg = llm.invoke([{"role":"system","content":system},{"role":"user","content":user_msg}])
     return msg.content
+
+def should_fallback(hits: List[Dict[str, Any]], min_sim: float = 0.25) -> bool:
+    if not hits: return True
+    best = max(h["score"] for h in hits)
+    return best < min_sim
+
+def make_email_draft(question: str, details: dict) -> dict:
+    subject = details.get("betreff") or f"Klärungsanfrage: {details.get('thema','Anliegen')}"
+    anrede  = details.get("anrede") or "Hallo,"
+    ziel    = details.get("ziel") or "Bitte um Rückmeldung"
+    frist   = details.get("frist") or "—"
+    kontext = details.get("kontext") or ""
+    body = (
+        f"{anrede}\n\n"
+        f"ich habe eine Frage zu: {details.get('thema','(Thema)')}\n\n"
+        f"Hintergrund:\n{kontext}\n\n"
+        f"Meine konkrete Frage:\n{question}\n\n"
+        f"Erwartetes Ergebnis/Ziel:\n{ziel}\n"
+        f"Frist/Zeitpunkt: {frist}\n\n"
+        f"Vielen Dank!\n"
+    )
+    return {"subject": subject, "body": body}
 
 # ---------- Chat State ----------
 if "messages" not in st.session_state:
@@ -272,6 +307,10 @@ if "await_snippet_confirm" not in st.session_state:
     st.session_state.await_snippet_confirm = False
 if "last_hits" not in st.session_state:
     st.session_state.last_hits: List[Dict[str, Any]] = []
+if "fallback_mode" not in st.session_state:
+    st.session_state.fallback_mode = False
+if "fallback_data" not in st.session_state:
+    st.session_state.fallback_data = {}
 
 st.subheader("💬 Chat")
 
@@ -316,23 +355,91 @@ if user_input:
             st.session_state.messages.append({"role": "assistant", "content": "Alles klar. Wenn du später die Quelle sehen möchtest, sag einfach „zeige Quelle“."})
         st.rerun()
 
-    # B) normale Frage
+    # B) normaler Durchlauf (Frage)
     st.session_state.messages.append({"role": "user", "content": user_input})
     if E is None:
         st.session_state.messages.append({"role": "assistant", "content": "Kein Index gefunden. Lade bitte Dokumente hoch oder baue den Index neu."})
         st.rerun()
 
     with st.spinner("Suche relevante Passagen…"):
-        hits = retrieve(user_input, top_k=4)
-    if not hits:
-        st.session_state.messages.append({"role":"assistant","content":"Keine Treffer in der Wissensbasis. Im Dokument wurden keine passenden Stellen gefunden."})
+        hits = pdf_hits(user_input, top_k=4)
+
+    if should_fallback(hits):
+        # Fallback aktivieren
+        st.session_state.fallback_mode = True
+        st.session_state.fallback_data = {
+            "original_question": user_input,
+            "thema": "",
+            "ziel": "",
+            "frist": "",
+            "kontext": "",
+            "betreff": ""
+        }
+        st.session_state.messages.append({"role":"assistant",
+            "content": "Ich finde dazu keine eindeutige Stelle in deinen Unterlagen. "
+                       "Lass mich eine saubere Anfrage vorbereiten. "
+                       "Dazu ein paar kurze Fragen: Thema? Ziel/Ergebnis? Frist/Termin? Optional kurzer Kontext."})
         st.rerun()
 
+    # keine Fallback-Bedingung -> normal antworten + Quellen optional
     with st.spinner("Formuliere Antwort…"):
         out = answer_with_context(user_input, hits)
-
     follow = "\n\n—\nSoll ich dir zeigen, wo ich das gefunden habe? Antworte einfach mit **„ja“**."
     st.session_state.messages.append({"role":"assistant","content": out + follow})
     st.session_state.last_hits = hits
     st.session_state.await_snippet_confirm = True
     st.rerun()
+
+# ---------- Fallback UI ----------
+if st.session_state.get("fallback_mode", False):
+    st.divider()
+    st.subheader("📮 Fallback: Strukturierte Anfrage erstellen")
+    with st.form("fallback_form"):
+        st.session_state.fallback_data["thema"]   = st.text_input("Thema / Betreffzeile (kurz):", value=st.session_state.fallback_data.get("thema",""))
+        st.session_state.fallback_data["ziel"]    = st.text_input("Gewünschtes Ergebnis / Entscheidung / Info:", value=st.session_state.fallback_data.get("ziel",""))
+        st.session_state.fallback_data["frist"]   = st.text_input("Frist / Termin (optional):", value=st.session_state.fallback_data.get("frist",""))
+        st.session_state.fallback_data["kontext"] = st.text_area("Kurzer Kontext (optional):", value=st.session_state.fallback_data.get("kontext",""), height=120)
+        st.session_state.fallback_data["betreff"] = st.text_input("E-Mail Betreff (optional, sonst aus Thema):", value=st.session_state.fallback_data.get("betreff",""))
+
+        st.markdown("**Empfänger aus den Unterlagen (automatisch erkannt):**")
+        options = [f"{c['email']} — {c['label']} (Quelle: {c['source']} S.{c.get('page','?')})" for c in CONTACTS] or ["(keine Kontakte in Dokumenten gefunden)"]
+        choice = st.selectbox("Vorschläge:", options, index=0)
+        to_manual = st.text_input("Oder Empfänger manuell eintragen (E-Mail):", value="")
+
+        submitted = st.form_submit_button("✍️ Anfrage-Entwurf erzeugen")
+        if submitted:
+            details = {
+                "thema":   st.session_state.fallback_data["thema"]   or "Rückfrage",
+                "ziel":    st.session_state.fallback_data["ziel"]    or "Bitte um Klärung",
+                "frist":   st.session_state.fallback_data["frist"],
+                "kontext": st.session_state.fallback_data["kontext"],
+                "betreff": st.session_state.fallback_data["betreff"],
+                "anrede":  "Hallo,"
+            }
+            draft = make_email_draft(st.session_state.fallback_data.get("original_question",""), details)
+            st.success("Entwurf erstellt")
+            st.write(f"**Betreff:** {draft['subject']}")
+            st.text_area("E-Mail-Text", draft["body"], height=260)
+
+            # Empfänger wählen
+            picked_email = ""
+            if CONTACTS and "keine Kontakte" not in options[0] and choice and "—" in choice:
+                picked_email = choice.split(" — ")[0].strip()
+            if to_manual.strip():
+                picked_email = to_manual.strip()
+
+            if picked_email:
+                mailto_url = build_mailto(
+                    to=picked_email,
+                    subject=draft["subject"],
+                    body=draft["body"]
+                )
+                st.markdown(f"[📧 Im eigenen Mailprogramm öffnen]({mailto_url})")
+                with st.expander("Link anzeigen/kopieren"):
+                    st.code(mailto_url, language="text")
+            else:
+                st.warning("Bitte einen Empfänger auswählen oder manuell eintragen.")
+
+    if st.button("❌ Fallback schließen"):
+        st.session_state.fallback_mode = False
+        st.experimental_rerun()
